@@ -19,6 +19,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.drawscope.clipRect
 import androidx.compose.ui.graphics.drawscope.withTransform
 import com.pandulapeter.kubriko.Kubriko
@@ -39,6 +40,9 @@ import com.pandulapeter.kubriko.helpers.extensions.isWithinViewportBounds
 import com.pandulapeter.kubriko.helpers.extensions.minus
 import com.pandulapeter.kubriko.helpers.extensions.transformForViewport
 import com.pandulapeter.kubriko.helpers.extensions.transformViewport
+import com.pandulapeter.kubriko.implementation.SyncStateFlow
+import com.pandulapeter.kubriko.types.Scale
+import com.pandulapeter.kubriko.types.SceneOffset
 import com.pandulapeter.kubriko.types.SceneSize
 import kotlinx.collections.immutable.ImmutableList
 import kotlinx.collections.immutable.persistentListOf
@@ -47,6 +51,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.debounce
@@ -55,11 +60,13 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.onStart
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlin.concurrent.atomics.AtomicBoolean
+import kotlin.concurrent.atomics.ExperimentalAtomicApi
 import kotlin.reflect.KClass
 import kotlin.uuid.ExperimentalUuidApi
 import kotlin.uuid.Uuid
 
-@OptIn(FlowPreview::class)
+@OptIn(FlowPreview::class, ExperimentalAtomicApi::class)
 internal class ActorManagerImpl(
     private val initialActors: List<Actor>,
     private val shouldUpdateActorsWhileNotRunning: Boolean,
@@ -75,6 +82,8 @@ internal class ActorManagerImpl(
     override val allActors = _allActors.asStateFlow()
     private lateinit var kubrikoImpl: KubrikoImpl
     private val operationChannel = Channel<Operation>(Channel.UNLIMITED)
+    private val processingSignal = Channel<Unit>(Channel.CONFLATED)
+    private val isProcessingOperations = AtomicBoolean(false)
     private val drawingOrderComparator = Comparator<Visible> { a, b ->
         val orderA = a.drawingOrder
         val orderB = b.drawingOrder
@@ -95,12 +104,8 @@ internal class ActorManagerImpl(
             .flowOn(Dispatchers.Default)
             .asStateFlowOnMainThread(persistentListOf())
     }
-    private val dynamicActors by autoInitializingLazy {
-        _allActors
-            .map { actors -> actors.filterIsInstance<Dynamic>().toImmutableList() }
-            .flowOn(Dispatchers.Default)
-            .asStateFlowOnMainThread(persistentListOf())
-    }
+    // Published together with _allActors (not derived asynchronously) so that onUpdate() never sees a stale list.
+    private val dynamicActors = MutableStateFlow<ImmutableList<Dynamic>>(persistentListOf())
     private val visibleActors by autoInitializingLazy {
         _allActors
             .map { actors -> actors.filterIsInstance<Visible>().toImmutableList() }
@@ -139,38 +144,68 @@ internal class ActorManagerImpl(
             .asStateFlowOnMainThread(persistentListOf())
     }
 
-    override val activeDynamicActors by lazy {
+    private val sleepFilterResult by lazy {
+        combine(
+            dynamicActors,
+            metadataManager.activeRuntimeInMilliseconds
+                .distinctUntilChangedWithDelay(invisibleActorMinimumRefreshTimeInMillis)
+                .onStart { emit(-1L) },
+            viewportManager.cameraPosition.debounce(8L),
+            viewportManager.size.debounce(8L),
+            viewportManager.scaleFactor.debounce(8L)
+        ) { allDynamicActors, _, viewportCenter, viewportSize, scaleFactor ->
+            SleepFilterResult(
+                source = allDynamicActors,
+                activeActors = filterAwakeActors(allDynamicActors, viewportCenter, viewportSize, scaleFactor),
+            )
+        }
+            .flowOn(Dispatchers.Default)
+            .asStateFlowOnMainThread(SleepFilterResult(persistentListOf(), persistentListOf()))
+    }
+
+    override val activeDynamicActors: StateFlow<ImmutableList<Dynamic>> by lazy {
         if (shouldPutFarAwayActorsToSleep) {
-            combine(
-                dynamicActors,
-                metadataManager.activeRuntimeInMilliseconds
-                    .distinctUntilChangedWithDelay(invisibleActorMinimumRefreshTimeInMillis)
-                    .onStart { emit(-1L) },
-                viewportManager.cameraPosition.debounce(8L),
-                viewportManager.size.debounce(8L),
-                viewportManager.scaleFactor.debounce(8L)
-            ) { allDynamicActors, _, viewportCenter, viewportSize, scaleFactor ->
-                val viewportTopLeft = viewportManager.topLeft.value
-                val viewportBottomRight = viewportManager.bottomRight.value
-                val edgeBuffer = minOf(viewportBottomRight.x - viewportTopLeft.x, viewportBottomRight.y - viewportTopLeft.y) / 2f
-                val scaledHalfViewportSize = SceneSize(viewportSize / (scaleFactor * 2f))
-                allDynamicActors
-                    .filter { actor ->
-                        if (!actor.isAlwaysActive && actor is Positionable) {
-                            actor.body.axisAlignedBoundingBox.isWithinViewportBounds(
-                                scaledHalfViewportSize = scaledHalfViewportSize,
-                                viewportCenter = viewportCenter,
-                                viewportEdgeBuffer = edgeBuffer,
-                            )
-                        } else {
-                            true
-                        }
-                    }
-                    .toImmutableList()
+            SyncStateFlow(
+                delegate = sleepFilterResult
+                    .map { it.activeActors }
+                    .asStateFlowOnMainThread(persistentListOf()),
+            ) {
+                // The asynchronous filter lags behind additions / removals, so fall back to filtering the current list on the calling thread.
+                val allDynamicActors = dynamicActors.value
+                val latestResult = sleepFilterResult.value
+                if (latestResult.source === allDynamicActors) latestResult.activeActors else filterAwakeActors(
+                    allDynamicActors = allDynamicActors,
+                    viewportCenter = viewportManager.cameraPosition.value,
+                    viewportSize = viewportManager.size.value,
+                    scaleFactor = viewportManager.scaleFactor.value,
+                )
             }
-                .flowOn(Dispatchers.Default)
-                .asStateFlowOnMainThread(persistentListOf())
         } else dynamicActors
+    }
+
+    private fun filterAwakeActors(
+        allDynamicActors: ImmutableList<Dynamic>,
+        viewportCenter: SceneOffset,
+        viewportSize: Size,
+        scaleFactor: Scale,
+    ): ImmutableList<Dynamic> {
+        val viewportTopLeft = viewportManager.topLeft.value
+        val viewportBottomRight = viewportManager.bottomRight.value
+        val edgeBuffer = minOf(viewportBottomRight.x - viewportTopLeft.x, viewportBottomRight.y - viewportTopLeft.y) / 2f
+        val scaledHalfViewportSize = SceneSize(viewportSize / (scaleFactor * 2f))
+        return allDynamicActors
+            .filter { actor ->
+                if (!actor.isAlwaysActive && actor is Positionable) {
+                    actor.body.axisAlignedBoundingBox.isWithinViewportBounds(
+                        scaledHalfViewportSize = scaledHalfViewportSize,
+                        viewportCenter = viewportCenter,
+                        viewportEdgeBuffer = edgeBuffer,
+                    )
+                } else {
+                    true
+                }
+            }
+            .toImmutableList()
     }
 
     override fun onInitialize(kubriko: Kubriko) {
@@ -180,14 +215,9 @@ internal class ActorManagerImpl(
         viewportManager = kubriko.viewportManager
         scope.launch(Dispatchers.Default) {
             while (isActive) {
+                processingSignal.receive()
                 try {
-                    val firstOp = operationChannel.receive()
-                    val batch = mutableListOf(firstOp)
-                    while (true) {
-                        val op = operationChannel.tryReceive().getOrNull() ?: break
-                        batch.add(op)
-                    }
-                    processBatch(batch)
+                    processPendingOperations()
                 } catch (_: Exception) {
                 }
             }
@@ -196,6 +226,8 @@ internal class ActorManagerImpl(
     }
 
     override fun onUpdate(deltaTimeInMilliseconds: Int) {
+        // Apply everything that was queued before this tick, so that it never depends on the background worker having caught up.
+        processPendingOperations()
         if (shouldUpdateActorsWhileNotRunning || stateManager.isRunning.value) {
             activeDynamicActors.value.forEach { it.update(deltaTimeInMilliseconds) }
         }
@@ -216,6 +248,27 @@ internal class ActorManagerImpl(
             }
         }
         return result
+    }
+
+    /**
+     * Drains and applies all queued operations. Called both from the background worker and at the start of every tick.
+     * Operations are only ever taken from the queue while holding the lock, so they are always applied in order.
+     */
+    private fun processPendingOperations() {
+        while (!isProcessingOperations.compareAndSet(expectedValue = false, newValue = true)) {
+            // The other caller is in the middle of a batch, wait for it to finish.
+        }
+        try {
+            val batch = mutableListOf<Operation>()
+            while (true) {
+                batch.add(operationChannel.tryReceive().getOrNull() ?: break)
+            }
+            if (batch.isNotEmpty()) {
+                processBatch(batch)
+            }
+        } finally {
+            isProcessingOperations.store(false)
+        }
     }
 
     @OptIn(ExperimentalUuidApi::class)
@@ -280,6 +333,7 @@ internal class ActorManagerImpl(
             newlyAdded.forEach { it.onAdded(kubrikoImpl) }
         }
         _allActors.value = workingList
+        dynamicActors.value = workingList.filterIsInstance<Dynamic>().toImmutableList()
         if (newlyRemoved.isNotEmpty()) {
             newlyRemoved.forEach {
                 (it as? Disposable)?.dispose()
@@ -290,26 +344,23 @@ internal class ActorManagerImpl(
 
     override fun add(vararg actors: Actor) {
         if (actors.isEmpty()) return
-        scope.launch {
-            operationChannel.send(Operation.Add(actors.toList()))
-        }
+        enqueue(Operation.Add(actors.toList()))
     }
 
     override fun add(actors: Collection<Actor>) = add(actors = actors.toTypedArray())
 
     override fun remove(vararg actors: Actor) {
         if (actors.isEmpty()) return
-        scope.launch {
-            operationChannel.send(Operation.Remove(actors.toList()))
-        }
+        enqueue(Operation.Remove(actors.toList()))
     }
 
     override fun remove(actors: Collection<Actor>) = remove(actors = actors.toTypedArray())
 
-    override fun removeAll() {
-        scope.launch {
-            operationChannel.send(Operation.RemoveAll)
-        }
+    override fun removeAll() = enqueue(Operation.RemoveAll)
+
+    private fun enqueue(operation: Operation) {
+        operationChannel.trySend(operation)
+        processingSignal.trySend(Unit)
     }
 
     @Composable
@@ -408,6 +459,11 @@ internal class ActorManagerImpl(
             }
         )
     }
+
+    private class SleepFilterResult(
+        val source: ImmutableList<Dynamic>,
+        val activeActors: ImmutableList<Dynamic>,
+    )
 
     private sealed class Operation {
         class Add(val actors: List<Actor>) : Operation()

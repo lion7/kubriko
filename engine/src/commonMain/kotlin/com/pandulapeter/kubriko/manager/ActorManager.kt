@@ -45,6 +45,7 @@ sealed class ActorManager(
     /**
      * Adds one or more [Actor]s to the game.
      * The actual addition logic will happen in a background thread so the result might not be instantaneous.
+     * Pending operations are always applied before the next tick is processed, so they take effect by the next frame at the latest.
      * Multiple calls invoked in the same frame will be batched.
      * Each actor's onAdded() callback function will get invoked just before the actual addition, on the main thread.
      */
@@ -53,6 +54,7 @@ sealed class ActorManager(
     /**
      * Adds a collection of [Actor]s to the game.
      * The actual addition logic will happen in a background thread so the result might not be instantaneous.
+     * Pending operations are always applied before the next tick is processed, so they take effect by the next frame at the latest.
      * Multiple calls invoked in the same frame will be batched.
      * Each actor's onAdded() callback function will get invoked just before the actual addition, on the main thread.
      */
@@ -61,6 +63,7 @@ sealed class ActorManager(
     /**
      * Removes one or more [Actor]s from the game.
      * The actual removal logic will happen in a background thread so the result might not be instantaneous.
+     * Pending operations are always applied before the next tick is processed, so they take effect by the next frame at the latest.
      * Multiple calls invoked in the same frame will be batched.
      * Each actor's onRemoved() callback function will get invoked just after the actual removal, on the main thread.
      */
@@ -69,6 +72,7 @@ sealed class ActorManager(
     /**
      * Removes a collection of [Actor]s from the game.
      * The actual removal logic will happen in a background thread so the result might not be instantaneous.
+     * Pending operations are always applied before the next tick is processed, so they take effect by the next frame at the latest.
      * Multiple calls invoked in the same frame will be batched.
      * Each actor's onRemoved() callback function will get invoked just after the actual removal, on the main thread.
      */
@@ -77,6 +81,7 @@ sealed class ActorManager(
     /**
      * Removes all [Actor]s from the game.
      * The actual removal logic will happen in a background thread so the result might not be instantaneous.
+     * Pending operations are always applied before the next tick is processed, so they take effect by the next frame at the latest.
      * Each actor's onRemoved() callback function will get invoked just after the actual removal, on the main thread.
      */
     abstract fun removeAll()

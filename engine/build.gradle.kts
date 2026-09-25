@@ -33,5 +33,8 @@ kotlin {
             implementation(libs.apache.commonsLang)
             implementation(libs.kotlinx.coroutines.desktop)
         }
+        desktopTest.dependencies {
+            implementation(libs.kotlin.test)
+        }
     }
 }
